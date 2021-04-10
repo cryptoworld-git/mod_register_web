@@ -39,45 +39,83 @@ end
 local register_tpl = get_template "register";
 local success_tpl = get_template "success";
 
-if next(captcha_options) ~= nil then
-	local recaptcha_tpl = get_template "recaptcha";
+-- COMPAT `or request.conn:ip()`
 
-	function generate_captcha(display_options)
-		return recaptcha_tpl.apply(setmetatable({
-			recaptcha_display_error = display_options and display_options.recaptcha_error
-			and ("&error="..display_options.recaptcha_error) or "";
-		}, {
-			__index = function (_, k)
-				if captcha_options[k] then return captcha_options[k]; end
-				module:log("error", "Missing parameter from captcha_options: %s", k);
-			end
-		}));
-	end
-	function verify_captcha(request, form, callback)
-		http.request("https://www.google.com/recaptcha/api/siteverify", {
-			body = http.formencode {
-				secret = captcha_options.recaptcha_private_key;
-				remoteip = request.conn:ip();
-				response = form["g-recaptcha-response"];
-			};
-		}, function (verify_result, code)
-			local result = json(verify_result);
-			if not result then
-				module:log("warn", "Unable to decode response from recaptcha: [%d] %s", code, verify_result);
-				callback(false, "Captcha API error");
-			elseif result.success == true then
-				callback(true);
-			else
-				callback(false, t_concat(result["error-codes"]));
-			end
-		end);
+if next(captcha_options) ~= nil then
+	local provider = captcha_options.provider;
+	if provider == nil or provider == "recaptcha" then
+		local recaptcha_tpl = get_template "recaptcha";
+
+		function generate_captcha(display_options)
+			return recaptcha_tpl.apply(setmetatable({
+				recaptcha_display_error = display_options and display_options.recaptcha_error
+				and ("&error="..display_options.recaptcha_error) or "";
+			}, {
+				__index = function (_, k)
+					if captcha_options[k] then return captcha_options[k]; end
+					module:log("error", "Missing parameter from captcha_options: %s", k);
+				end
+			}));
+		end
+		function verify_captcha(request, form, callback)
+			http.request("https://www.google.com/recaptcha/api/siteverify", {
+				body = http.formencode {
+					secret = captcha_options.recaptcha_private_key;
+					remoteip = request.ip or request.conn:ip();
+					response = form["g-recaptcha-response"];
+				};
+			}, function (verify_result, code)
+				local result = json(verify_result);
+				if not result then
+					module:log("warn", "Unable to decode response from recaptcha: [%d] %s", code, verify_result);
+					callback(false, "Captcha API error");
+				elseif result.success == true then
+					callback(true);
+				else
+					callback(false, t_concat(result["error-codes"]));
+				end
+			end);
+		end
+	elseif provider == "hcaptcha" then
+		local captcha_tpl = get_template "hcaptcha";
+
+		function generate_captcha(display_options)
+			return captcha_tpl.apply(setmetatable({
+				captcha_display_error = display_options and display_options.captcha_error
+				and ("&error="..display_options.captcha_error) or "";
+			}, {
+				__index = function (_, k)
+					if captcha_options[k] then return captcha_options[k]; end
+					module:log("error", "Missing parameter from captcha_options: %s", k);
+				end
+			}));
+		end
+		function verify_captcha(request, form, callback)
+			http.request("https://hcaptcha.com/siteverify", {
+				body = http.formencode {
+					secret = captcha_options.captcha_private_key;
+					remoteip = request.ip or request.conn:ip();
+					response = form["h-captcha-response"];
+				};
+			}, function (verify_result, code)
+				local result = json(verify_result);
+				if not result then
+					module:log("warn", "Unable to decode response from hcaptcha: [%d] %s", code, verify_result);
+					callback(false, "Captcha API error");
+				elseif result.success == true then
+					callback(true);
+				else
+					callback(false, t_concat(result["error-codes"]));
+				end
+			end);
+		end
 	end
 else
-	module:log("debug", "No Recaptcha options set, using fallback captcha")
+	module:log("debug", "No captcha options set, using fallback captcha")
 	local random = math.random;
 	local hmac_sha1 = require "util.hashes".hmac_sha1;
 	local secret = require "util.uuid".generate()
-	local ops = { '*' };
+	local ops = { '+', '-' };
 	local captcha_tpl = get_template "simplecaptcha";
 	function generate_captcha()
 		local op = ops[random(1, #ops)];
@@ -85,40 +123,23 @@ else
 		repeat
 			y = random(1, 9);
 		until x ~= y;
-		local a = random(999, 999999);
-		local b = random(999, 999999);
-		local c = random(999, 999999);
 		local answer;
-		local encoded_op;
-		if op == '/' then
-			encoded_op = "&#47;";
-			answer = x / y;
-		elseif op == '%' then
-			encoded_op = "&#37;";
-			answer = x % y;
-		elseif op == '*' then
-			encoded_op = "&#42;";
-			answer = x * y;
+		if op == '+' then
+			answer = x + y;
 		elseif op == '-' then
 			if x < y then
 				-- Avoid negative numbers
 				x, y = y, x;
 			end
-			encoded_op = "&#45;";
 			answer = x - y;
 		end
 		local challenge = hmac_sha1(secret, answer, true);
-	        
-		
-		local encoded_x = "<span style=\"display:none;\">5626754</span>"..x.."<span style=\"display:none;\">98234</span>";
-		local encoded_y = "<span style=\"display:none;\">5626754</span>"..y.."<span style=\"display:none;\">98234</span>";;
-
 		return captcha_tpl.apply {
-			a = a, b = b, c = c, op = encoded_op, x = encoded_x, y = encoded_y, challenge = challenge;
+			op = op, x = x, y = y, challenge = challenge;
 		};
 	end
 	function verify_captcha(request, form, callback)
-		if hmac_sha1(secret, form.captcha_reply, true) == form.captcha_challenge then
+		if hmac_sha1(secret, form.captcha_reply or "", true) == form.captcha_challenge then
 			callback(true);
 		else
 			callback(false, "Captcha verification failed");
@@ -144,7 +165,7 @@ function register_user(form, origin)
 	local jid = nil;
 	form.username, form.password, form.confirm_password = nil, nil, nil;
 
-	local prepped_username = nodeprep(username);
+	local prepped_username = nodeprep(username, true);
 	if not prepped_username then
 		return nil, "Username contains forbidden characters";
 	end
@@ -154,7 +175,7 @@ function register_user(form, origin)
 	if usermanager.user_exists(prepped_username, module.host) then
 		return nil, "Username already taken";
 	end
-	local registering = { username = prepped_username , host = module.host, additional = form, ip = origin.conn:ip(), allowed = true }
+	local registering = { username = prepped_username , host = module.host, additional = form, ip = origin.ip or origin.conn:ip(), allowed = true }
 	module:fire_event("user-registering", registering);
 	if not registering.allowed then
 		return nil, registering.reason or "Registration not allowed";
@@ -179,7 +200,7 @@ function register_user(form, origin)
 			username = prepped_username,
 			host = module.host,
 			source = module.name,
-			ip = origin.conn:ip(),
+			ip = origin.ip or origin.conn:ip(),
 		});
 	end
 	return jid, err;
@@ -213,6 +234,7 @@ function handle_form(event)
 end
 
 module:provides("http", {
+	title = module:get_option_string("register_web_title", "Account Registration");
 	route = {
 		GET = generate_page;
 		["GET /"] = generate_page;
